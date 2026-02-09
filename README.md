@@ -361,6 +361,9 @@ uv run playwright install chromium
 uv run pytest tests/
 ```
 
+## 已添加env导出
+每次run或手动run action会将必须的env压缩加密导出, 密码由环境变量ZIP_PASSWORD设定, 最终在action处点击链接下载即可
+
 ## 免责声明
 
 本脚本仅用于学习和研究目的，使用前请确保遵守相关网站的使用条款.
