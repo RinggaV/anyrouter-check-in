@@ -96,3 +96,38 @@ jobs:
       run: |
         echo "签到任务执行完成"
         echo "时间: $(Get-Date)"
+        
+    - name: 导出环境变量并加密打包
+      shell: pwsh
+      env:
+        # 这里的变量需要与你“执行签到”步骤中的保持一致
+        ANYROUTER_ACCOUNTS: ${{ secrets.ANYROUTER_ACCOUNTS }}
+        PROVIDERS: ${{ secrets.PROVIDERS }}
+        # ... (根据需要添加其他你想导出的变量)
+        ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD || 'DefaultPass123' }} # 请在 Secrets 中设置 ZIP_PASSWORD
+      run: |
+        # 1. 创建输出目录
+        New-Item -ItemType Directory -Force -Path "./outputs"
+        
+        # 2. 将环境变量写入对应文件
+        # 注意：这里只选取了关键的几个作为示例，你可以按需增减
+        $envVars = @("ANYROUTER_ACCOUNTS", "PROVIDERS") 
+        foreach ($var in $envVars) {
+            $val = Get-ChildItem Env:$var -ErrorAction SilentlyContinue
+            if ($val) {
+                $val.Value | Out-File -FilePath "./outputs/$var.txt" -Encoding utf8
+            }
+        }
+
+        # 3. 使用 7z 进行加密压缩 (Windows-2025 自带 7z)
+        # -p 指定密码，-mhe=on 开启文件名加密
+        7z a -p"$env:ZIP_PASSWORD" -mhe=on env_backup.7z ./outputs/*
+
+        echo "✅ 环境变量已导出并加密打包"
+
+    - name: 上传加密备份文件
+      uses: actions/upload-artifact@v4
+      with:
+        name: Encrypted-Env-Files
+        path: env_backup.7z
+        retention-days: 1 # 设置保留天数，过期自动删除更安全
