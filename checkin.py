@@ -323,74 +323,61 @@ async def main():
 			need_notify = True  # 异常也需要通知
 			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
 
-	# 检查余额变化
-	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
-	if current_balance_hash:
-		if last_balance_hash is None:
-			# 首次运行
-			balance_changed = True
-			need_notify = True
-			print('[NOTIFY] First run detected, will send notification with current balances')
-		elif current_balance_hash != last_balance_hash:
-			# 余额有变化
-			balance_changed = True
-			need_notify = True
-			print('[NOTIFY] Balance changes detected, will send notification')
-		else:
-			print('[INFO] No balance changes detected')
-
-	# 为有余额变化的情况添加所有成功账号到通知内容
-	if balance_changed:
-		for i, account in enumerate(accounts):
-			account_key = f'account_{i + 1}'
-			if account_key in current_balances:
-				account_name = account.get_display_name(i)
-				# 只添加成功获取余额的账号，且避免重复添加
-				account_result = f'[BALANCE] {account_name}'
-				account_result += f'\n:money: Current balance: ${current_balances[account_key]["quota"]}, Used: ${current_balances[account_key]["used"]}'
-				# 检查是否已经在通知内容中（避免重复）
-				if not any(account_name in item for item in notification_content):
-					notification_content.append(account_result)
-
-	# 保存当前余额hash
-	if current_balance_hash:
-		save_balance_hash(current_balance_hash)
-
-	# 在发送通知前增加环境变量判断
+	# 1. 检查强制跳过开关 (保留原有功能)
     skip_notify = os.getenv('SKIP_NOTIFY', 'false').lower() in ('true', '1', 'yes')
 
+    # 2. 检查余额变化 (仅记录，不直接触发通知)
+    current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
+    if current_balance_hash:
+        if last_balance_hash is None or current_balance_hash != last_balance_hash:
+            balance_changed = True
+            print('[INFO] Balance changes detected.')
+        else:
+            print('[INFO] No balance changes detected.')
+
+    # 保存当前余额hash
+    if current_balance_hash:
+        save_balance_hash(current_balance_hash)
+
+    # 3. 最终推送逻辑判断
+    # 逻辑：(有失败或异常) 且 (没有开启强制跳过)
     if need_notify and notification_content:
-        # 构建通知内容
+        # 如果要发失败通知，顺带把余额变化也加上
+        if balance_changed:
+            for i, account in enumerate(accounts):
+                account_key = f'account_{i + 1}'
+                if account_key in current_balances:
+                    account_name = account.get_display_name(i)
+                    account_result = f'[BALANCE] {account_name}\n:money: Balance: ${current_balances[account_key]["quota"]}, Used: ${current_balances[account_key]["used"]}'
+                    if not any(account_name in item for item in notification_content):
+                        notification_content.append(account_result)
+
+        # 构建通知文本
         summary = [
             '[STATS] Check-in result statistics:',
             f'[SUCCESS] Success: {success_count}/{total_count}',
             f'[FAIL] Failed: {total_count - success_count}/{total_count}',
         ]
-
-        if success_count == total_count:
-            summary.append('[SUCCESS] All accounts check-in successful!')
-        elif success_count > 0:
-            summary.append('[WARN] Some accounts check-in successful')
-        else:
-            summary.append('[ERROR] All accounts check-in failed')
-
         time_info = f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
         notify_content = '\n\n'.join([time_info, '\n'.join(notification_content), '\n'.join(summary)])
 
+        print("\n--- Notification Details ---")
         print(notify_content)
-        
-        # --- 增加的判断逻辑 ---
-        if skip_notify:
-            print('[INFO] SKIP_NOTIFY is set, notification suppressed.')
-        else:
-            notify.push_message('AnyRouter Check-in Alert', notify_content, msg_type='text')
-            print('[NOTIFY] Notification sent due to failures or balance changes')
-        # ---------------------
-    else:
-        print('[INFO] All accounts successful and no balance changes detected, notification skipped')
 
-    # 设置退出码
-    sys.exit(0 if success_count > 0 else 1)
+        # 执行推送判断
+        if skip_notify:
+            print('[INFO] Notification triggered by FAILURE, but SKIP_NOTIFY is enabled. Suppression active.')
+        else:
+            notify.push_message('AnyRouter Check-in FAILURE Alert', notify_content, msg_type='text')
+            print('[NOTIFY] Failure notification sent.')
+            
+    elif balance_changed and not need_notify:
+        print('[INFO] All successful. Balance changed, but skipping notification per "Notify on Failure" policy.')
+    else:
+        print('[INFO] All accounts successful and no critical errors. Notification skipped.')
+
+    # 设置退出码：只要有失败，Workflow 就会显示红色警告
+    sys.exit(0 if success_count == total_count else 1)
 	
 	# if need_notify and notification_content:
 	# 	# 构建通知内容
