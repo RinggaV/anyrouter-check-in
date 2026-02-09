@@ -356,33 +356,69 @@ async def main():
 	if current_balance_hash:
 		save_balance_hash(current_balance_hash)
 
-	if need_notify and notification_content:
-		# 构建通知内容
-		summary = [
-			'[STATS] Check-in result statistics:',
-			f'[SUCCESS] Success: {success_count}/{total_count}',
-			f'[FAIL] Failed: {total_count - success_count}/{total_count}',
-		]
+	# 在发送通知前增加环境变量判断
+    skip_notify = os.getenv('SKIP_NOTIFY', 'false').lower() in ('true', '1', 'yes')
 
-		if success_count == total_count:
-			summary.append('[SUCCESS] All accounts check-in successful!')
-		elif success_count > 0:
-			summary.append('[WARN] Some accounts check-in successful')
-		else:
-			summary.append('[ERROR] All accounts check-in failed')
+    if need_notify and notification_content:
+        # 构建通知内容
+        summary = [
+            '[STATS] Check-in result statistics:',
+            f'[SUCCESS] Success: {success_count}/{total_count}',
+            f'[FAIL] Failed: {total_count - success_count}/{total_count}',
+        ]
 
-		time_info = f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+        if success_count == total_count:
+            summary.append('[SUCCESS] All accounts check-in successful!')
+        elif success_count > 0:
+            summary.append('[WARN] Some accounts check-in successful')
+        else:
+            summary.append('[ERROR] All accounts check-in failed')
 
-		notify_content = '\n\n'.join([time_info, '\n'.join(notification_content), '\n'.join(summary)])
+        time_info = f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+        notify_content = '\n\n'.join([time_info, '\n'.join(notification_content), '\n'.join(summary)])
 
-		print(notify_content)
-		notify.push_message('AnyRouter Check-in Alert', notify_content, msg_type='text')
-		print('[NOTIFY] Notification sent due to failures or balance changes')
-	else:
-		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
+        print(notify_content)
+        
+        # --- 增加的判断逻辑 ---
+        if skip_notify:
+            print('[INFO] SKIP_NOTIFY is set, notification suppressed.')
+        else:
+            notify.push_message('AnyRouter Check-in Alert', notify_content, msg_type='text')
+            print('[NOTIFY] Notification sent due to failures or balance changes')
+        # ---------------------
+    else:
+        print('[INFO] All accounts successful and no balance changes detected, notification skipped')
 
-	# 设置退出码
-	sys.exit(0 if success_count > 0 else 1)
+    # 设置退出码
+    sys.exit(0 if success_count > 0 else 1)
+	
+	# if need_notify and notification_content:
+	# 	# 构建通知内容
+	# 	summary = [
+	# 		'[STATS] Check-in result statistics:',
+	# 		f'[SUCCESS] Success: {success_count}/{total_count}',
+	# 		f'[FAIL] Failed: {total_count - success_count}/{total_count}',
+	# 	]
+
+	# 	if success_count == total_count:
+	# 		summary.append('[SUCCESS] All accounts check-in successful!')
+	# 	elif success_count > 0:
+	# 		summary.append('[WARN] Some accounts check-in successful')
+	# 	else:
+	# 		summary.append('[ERROR] All accounts check-in failed')
+
+	# 	time_info = f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+
+	# 	notify_content = '\n\n'.join([time_info, '\n'.join(notification_content), '\n'.join(summary)])
+
+	# 	print(notify_content)
+	# 	notify.push_message('AnyRouter Check-in Alert', notify_content, msg_type='text')
+	# 	print('[NOTIFY] Notification sent due to failures or balance changes')
+	# else:
+	# 	print('[INFO] All accounts successful and no balance changes detected, notification skipped')
+
+	# # 设置退出码
+	# sys.exit(0 if success_count > 0 else 1)
 
 
 def run_main():
