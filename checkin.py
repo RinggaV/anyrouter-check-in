@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AnyRouter.top 自动签到脚本
-修复配置读取逻辑，支持 Turnstile Token 注入与 WAF 绕过
+改进版：优化 Turnstile Token 获取逻辑
 """
 
 import asyncio
@@ -45,64 +45,132 @@ def generate_balance_hash(balances):
     balance_json = json.dumps(simple_balances, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(balance_json.encode('utf-8')).hexdigest()[:16]
 
-async def get_interactive_waf_data(account_name: str, domain: str):
+async def get_interactive_waf_data(account_name: str, domain: str, max_retries: int = 2):
     """
-    通过模拟点击和显式等待绕过交互式质询
+    通过模拟浏览器绕过 Cloudflare Turnstile 验证
+    改进版：增加等待时间，优化日志输出
     """
-    print(f'[WAF] {account_name}: 启动交互式浏览器环境...')
-    async with async_playwright() as p:
-        import tempfile
-        with tempfile.TemporaryDirectory() as temp_dir:
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=temp_dir,
-                headless=True,
-                user_agent=COMMON_UA,
-                args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
-            )
-            page = await context.new_page()
-            try:
-                # 访问个人中心页面触发质询
-                await page.goto(f"{domain}/console/personal", wait_until='networkidle', timeout=60000)
-                print(f'[WAF] {account_name}: 等待 Cloudflare 质询 (15s)...')
-                await asyncio.sleep(15) 
-                
-                # 截获 Token
-                token = await page.evaluate("typeof turnstile !== 'undefined' ? turnstile.getResponse() : ''")
-                cookies_list = await page.context.cookies()
-                waf_cookies = {c['name']: c['value'] for c in cookies_list}
-                
-                await context.close()
-                return {'cookies': waf_cookies, 'token': token}
-            except Exception as e:
-                print(f'[FAILED] {account_name}: 浏览器交互失败: {e}')
-                await context.close()
+    for attempt in range(max_retries):
+        if attempt > 0:
+            print(f'[WAF] {account_name}: 第 {attempt + 1}/{max_retries} 次尝试...')
+        else:
+            print(f'[WAF] {account_name}: 启动交互式浏览器环境...')
+
+        try:
+            async with async_playwright() as p:
+                import tempfile
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    context = await p.chromium.launch_persistent_context(
+                        user_data_dir=temp_dir,
+                        headless=True,
+                        user_agent=COMMON_UA,
+                        args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
+                    )
+                    page = await context.new_page()
+
+                    try:
+                        # 访问个人中心页面触发质询
+                        await page.goto(f"{domain}/console/personal", wait_until='networkidle', timeout=60000)
+                        print(f'[WAF] {account_name}: 页面加载完成，等待 Cloudflare Turnstile 验证...')
+
+                        # 智能等待 Turnstile 加载和完成
+                        token = ""
+                        max_wait_time = 90  # 最多等待90秒（从60秒增加到90秒）
+                        check_interval = 2  # 每2秒检查一次
+                        last_log_time = -10  # 初始化为负数，确保第一次立即打印
+
+                        for i in range(0, max_wait_time, check_interval):
+                            await asyncio.sleep(check_interval)
+
+                            # 检查 Turnstile 是否已加载
+                            turnstile_exists = await page.evaluate("typeof turnstile !== 'undefined'")
+                            if not turnstile_exists:
+                                if i - last_log_time >= 10:  # 每10秒打印一次
+                                    print(f'[WAF] {account_name}: 等待 Turnstile 加载... ({i+check_interval}s)')
+                                    last_log_time = i
+                                continue
+
+                            # 尝试获取 token
+                            try:
+                                token = await page.evaluate("turnstile.getResponse()")
+                                if token:
+                                    print(f'[WAF] {account_name}: ✅ 成功获取 Turnstile Token (耗时 {i+check_interval}s)')
+                                    break
+                                else:
+                                    if i - last_log_time >= 10:  # 每10秒打印一次
+                                        print(f'[WAF] {account_name}: Token 尚未生成，继续等待... ({i+check_interval}s)')
+                                        last_log_time = i
+                            except Exception as e:
+                                if i - last_log_time >= 10:
+                                    print(f'[WAF] {account_name}: 获取 Token 时出错: {e}')
+                                    last_log_time = i
+
+                        # 获取所有 cookies
+                        cookies_list = await page.context.cookies()
+                        waf_cookies = {c['name']: c['value'] for c in cookies_list}
+
+                        await context.close()
+
+                        if token:
+                            return {'cookies': waf_cookies, 'token': token}
+                        else:
+                            print(f'[WAF] {account_name}: ⚠️ 第 {attempt + 1}/{max_retries} 次尝试：Token 仍为空')
+                            if attempt < max_retries - 1:
+                                print(f'[WAF] {account_name}: 等待 5 秒后重试...')
+                                await asyncio.sleep(5)
+                                continue
+                            else:
+                                print(f'[WAF] {account_name}: ❌ 已达最大重试次数，返回空 Token')
+                                return {'cookies': waf_cookies, 'token': ''}
+
+                    except Exception as e:
+                        print(f'[WAF] {account_name}: ⚠️ 第 {attempt + 1}/{max_retries} 次尝试失败: {e}')
+                        await context.close()
+                        if attempt < max_retries - 1:
+                            print(f'[WAF] {account_name}: 等待 5 秒后重试...')
+                            await asyncio.sleep(5)
+                            continue
+                        else:
+                            return None
+
+        except Exception as e:
+            print(f'[WAF] {account_name}: ❌ 浏览器启动失败: {e}')
+            if attempt < max_retries - 1:
+                await asyncio.sleep(5)
+                continue
+            else:
                 return None
+
+    return None
 
 async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig):
     account_name = account.get_display_name(account_index)
     provider_config = app_config.get_provider(account.provider)
-    if not provider_config: return False, None
+    if not provider_config:
+        print(f"[ERROR] {account_name}: 未找到 provider 配置: {account.provider}")
+        return False, None
 
     print(f"\n{'-'*30}\n[账号] {account_name}\n[站点] {account.provider}\n{'-'*30}")
 
-    # --- 修正点：从 ProviderConfig 对象中安全读取自定义属性 ---
-    # 由于 AppConfig 加载时可能未映射 bypass_method，我们尝试直接从原始 JSON 配置中提取
+    # 从 ProviderConfig 对象中读取 bypass_method
     bypass_method = ""
     if hasattr(app_config, 'providers_raw'):
         raw_info = app_config.providers_raw.get(account.provider, {})
         bypass_method = raw_info.get('bypass_method', '')
     else:
-        # 兼容性兜底方案
         bypass_method = getattr(provider_config, 'bypass_method', '')
-    
+
     needs_waf = bypass_method == 'waf_cookies'
     user_cookies_data = account.cookies
     waf_data = None
-    
+
     if needs_waf:
         waf_data = await get_interactive_waf_data(account_name, provider_config.domain)
+        if not waf_data:
+            print(f"   ❌ WAF 绕过完全失败，无法继续")
+            return False, {'success': False, 'error': 'WAF bypass failed'}
 
-    # --- 融合 Cookie 构造逻辑 ---
+    # 融合 Cookie 构造逻辑
     final_cookies_dict = {}
     if isinstance(user_cookies_data, dict):
         final_cookies_dict.update(user_cookies_data)
@@ -145,34 +213,53 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
                     user_info = {'success': True, 'quota': q, 'used_quota': round(u.get('used_quota', 0)/500000, 2), 'display': f'💰 余额: ${q}'}
                     print(f"   ✅ {user_info['display']}")
                 else:
-                    return False, {'success': False, 'error': data.get('message')}
+                    error_msg = data.get('message', '未知错误')
+                    print(f"   ❌ 获取用户信息失败: {error_msg}")
+                    return False, {'success': False, 'error': error_msg}
             else:
-                return False, {'success': False, 'error': f'HTTP {res_info.status_code}'}
+                error_msg = f'HTTP {res_info.status_code}'
+                print(f"   ❌ 请求失败: {error_msg}")
+                return False, {'success': False, 'error': error_msg}
         except Exception as e:
-            return False, {'success': False, 'error': str(e)}
+            error_msg = str(e)
+            print(f"   ❌ 请求异常: {error_msg}")
+            return False, {'success': False, 'error': error_msg}
 
         # 执行签到
+        # 如果没有配置签到接口，说明查询用户信息时已自动完成签到（如 agentrouter）
+        if not provider_config.sign_in_path:
+            print(f"   ✅ 签到成功 (无需调用签到接口)")
+            return True, user_info
+
         payload = {}
         if waf_data and waf_data.get('token'):
-            payload['token'] = waf_data['token'] # 自动填入截获的 Turnstile Token
+            payload['token'] = waf_data['token']
+            print(f"   🔑 使用 Turnstile Token: {waf_data['token'][:20]}...")
+        elif needs_waf and (not waf_data or not waf_data.get('token')):
+            # 如果需要 WAF 但没有获取到 token
+            print(f"   ⚠️ 警告: 需要 Turnstile Token 但未获取到，尝试继续签到...")
 
         try:
             checkin_url = f"{provider_config.domain}{provider_config.sign_in_path}"
             checkin_headers = headers.copy()
             checkin_headers['Content-Type'] = 'application/json'
-            
+
             res_chk = await client.post(checkin_url, headers=checkin_headers, json=payload)
             res_json = res_chk.json()
             msg = res_json.get('message', '') or res_json.get('msg', '')
             is_done = any(k in msg for k in ["今日已签到", "重复签到", "已经签到"])
-            
+
             if res_json.get('success') or is_done:
-                if is_done: print(f"   ℹ️ 重复签到 (成功)")
+                if is_done:
+                    print(f"   ℹ️ 重复签到 (成功)")
+                else:
+                    print(f"   ✅ 签到成功")
                 return True, user_info
             else:
                 print(f"   ❌ 签到失败: {msg}")
                 return False, user_info
-        except Exception:
+        except Exception as e:
+            print(f"   ❌ 签到请求异常: {str(e)}")
             return False, user_info
 
 async def main():
@@ -190,7 +277,7 @@ async def main():
         ok, info = await check_in_account(acc, i, app_config)
         if ok: success_count += 1
         else: need_push = True
-        
+
         status = "[SUCCESS]" if ok else "[FAIL]"
         if info and info.get('success'):
             current_balances[f'acc_{i}'] = {'quota': info['quota']}
@@ -204,7 +291,7 @@ async def main():
     skip_notify = os.getenv('SKIP_NOTIFY', 'false').lower() in ('true', '1', 'yes')
     if need_push and not skip_notify:
         notify.push_message('AnyRouter 签到结果报告', "\n\n".join(notify_list))
-    
+
     sys.exit(0 if success_count == total_count else 1)
 
 if __name__ == '__main__':
