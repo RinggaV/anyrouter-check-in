@@ -112,7 +112,7 @@ async def get_waf_bypass_data_browser(account_name: str, domain: str, max_wait: 
                 try:
                     # 访问页面
                     print(f'[Browser] {account_name}: 访问 {domain}/console/personal')
-                    await page.goto(f"{domain}/console/personal", wait_until='networkidle', timeout=60000)
+                    await page.goto(f"{domain}/console/personal", wait_until='domcontentloaded', timeout=10000)
                     await asyncio.sleep(2)
 
                     # 检查 Turnstile 是否存在
@@ -181,7 +181,7 @@ async def get_waf_bypass_data(account_name: str, domain: str):
 
                     try:
                         print(f'[WAF] {account_name}: 访问页面获取 cookies 和 sitekey...')
-                        await page.goto(f"{domain}/console/personal", wait_until='networkidle', timeout=60000)
+                        await page.goto(f"{domain}/console/personal", wait_until='domcontentloaded', timeout=10000)
                         await asyncio.sleep(2)
 
                         # 提取 sitekey
