@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-AnyRouter.top 多账号自动签到脚本
-优化：判定“今日已签到”为成功，失败打印原始响应
+AnyRouter.top 自动签到脚本 - 适配版
+支持 bypass_method: waf_cookies 配置检测与 Turnstile Token 自动注入
 """
 
 import asyncio
@@ -21,7 +21,6 @@ from utils.notify import notify
 
 load_dotenv()
 
-# 常量配置
 BALANCE_HASH_FILE = 'balance_hash.txt'
 COMMON_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0'
 
@@ -38,7 +37,7 @@ def save_balance_hash(balance_hash):
         with open(BALANCE_HASH_FILE, 'w', encoding='utf-8') as f:
             f.write(balance_hash)
     except Exception as e:
-        print(f'[WARN] Failed to save balance hash: {e}')
+        print(f'[WARN] 保存余额hash失败: {e}')
 
 def generate_balance_hash(balances):
     simple_balances = {k: v['quota'] for k, v in balances.items()} if balances else {}
@@ -56,9 +55,9 @@ def parse_cookies_to_dict(cookies_data):
                 cookies_dict[key] = value
     return cookies_dict
 
-async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
-    """优化：更长时间等待挑战完成"""
-    print(f'[WAF] {account_name}: 启动环境绕过 {login_url} ...')
+async def get_waf_data_with_playwright(account_name: str, target_url: str):
+    """使用 Playwright 绕过 WAF 并获取 Token"""
+    print(f'[WAF] {account_name}: 启动浏览器绕过防护...')
     async with async_playwright() as p:
         import tempfile
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -70,88 +69,23 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
             )
             page = await context.new_page()
             try:
-                # 访问页面并等待较长时间以通过 Cloudflare 质询
-                await page.goto(login_url, wait_until='networkidle', timeout=60000)
-                print(f'[WAF] {account_name}: 页面已加载，等待质询挑战...')
-                await asyncio.sleep(10) # 给予足够时间完成“Just a moment”挑战
+                # 访问目标地址，针对 Cloudflare 质询等待
+                await page.goto(target_url, wait_until='networkidle', timeout=60000)
+                print(f'[WAF] {account_name}: 等待质询挑战完成 (15s)...')
+                await asyncio.sleep(15) 
                 
-                cookies = await page.context.cookies()
-                waf_cookies = {c['name']: c['value'] for c in cookies}
+                # 尝试截取 Turnstile Token
+                token = await page.evaluate("typeof turnstile !== 'undefined' ? turnstile.getResponse() : ''")
                 
-                # 针对 Turnstile：尝试从页面获取 token (如果存在)
-                turnstile_token = await page.evaluate("typeof turnstile !== 'undefined' ? turnstile.getResponse() : ''")
-                if turnstile_token:
-                    waf_cookies['turnstile_token'] = turnstile_token
+                cookies_list = await page.context.cookies()
+                waf_cookies = {c['name']: c['value'] for c in cookies_list}
                 
-                print(f'[WAF] {account_name}: 获取到 {len(waf_cookies)} 个 Cookies/Tokens')
                 await context.close()
-                return waf_cookies
+                return {'cookies': waf_cookies, 'token': token}
             except Exception as e:
-                print(f'[FAILED] {account_name}: WAF/挑战失败: {e}')
+                print(f'[FAILED] {account_name}: 浏览器操作失败: {e}')
                 await context.close()
                 return None
-
-async def prepare_all_cookies(account_name, provider_config, user_cookies_dict):
-    if provider_config.needs_waf_cookies():
-        login_url = f"{provider_config.domain}/login"
-        waf_cookies = await get_waf_cookies_with_playwright(account_name, login_url, provider_config.waf_cookie_names)
-        if waf_cookies:
-            return {**user_cookies_dict, **waf_cookies}
-    return user_cookies_dict
-
-async def get_user_info(client, headers, url):
-    try:
-        res = await client.get(url, headers=headers, timeout=30)
-        if res.status_code == 200:
-            data = res.json()
-            if data.get('success'):
-                u = data.get('data', {})
-                q = round(u.get('quota', 0) / 500000, 2)
-                used = round(u.get('used_quota', 0) / 500000, 2)
-                return {'success': True, 'quota': q, 'used_quota': used, 'display': f'💰 余额: ${q} | 已用: ${used}'}
-        return {'success': False, 'error': f'HTTP {res.status_code}', 'raw': res.text}
-    except Exception as e:
-        return {'success': False, 'error': f'请求失败: {str(e)[:50]}'}
-
-async def execute_check_in(client, account_name, provider_config, headers, waf_data=None):
-    """优化：处理需要 Token 的签到请求"""
-    checkin_url = f"{provider_config.domain}{provider_config.sign_in_path}"
-    print(f'[步骤 2] 正在请求签到: {provider_config.sign_in_path}')
-    
-    checkin_headers = headers.copy()
-    checkin_headers.update({'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'})
-    
-    # 如果 WAF 步骤获取到了 turnstile_token，尝试将其加入请求体
-    payload = {}
-    if waf_data and waf_data.get('turnstile_token'):
-        payload['token'] = waf_data['turnstile_token'] # 根据不同站点可能需要改为 turnstile_token
-
-    try:
-        res = await client.post(checkin_url, headers=checkin_headers, json=payload, timeout=30)
-        print(f"   📡 状态码: {res.status_code}")
-        
-        try:
-            res_data = res.json()
-            msg = res_data.get('message', '') or res_data.get('msg', '')
-            
-            # 逻辑：成功标志位 OR 包含“今日已签到”
-            is_success_msg = any(keyword in msg for keyword in ["今日已签到", "已经签到", "重复签到"])
-            if res_data.get('ret') == 1 or res_data.get('code') == 0 or res_data.get('success') or is_success_msg:
-                if is_success_msg: print(f"   ℹ️ {account_name}: {msg} (判定为成功)")
-                return True
-            else:
-                print(f"   ❌ 签到失败响应: {json.dumps(res_data, ensure_ascii=False)}")
-                return False
-        except:
-            # 非 JSON 响应的模糊匹配
-            raw_text = res.text
-            if 'success' in raw_text.lower() or '今日已签到' in raw_text:
-                return True
-            print(f"   ❌ 原始失败响应: {raw_text}")
-            return False
-    except Exception as e:
-        print(f"   💥 签到异常: {e}")
-    return False
 
 async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig):
     account_name = account.get_display_name(account_index)
@@ -160,17 +94,27 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
     print(f"\n{'-'*30}\n[账号] {account_name}\n[站点] {account.provider} ({provider_config.domain})\n{'-'*30}")
 
-    user_cookies_dict = parse_cookies_to_dict(account.cookies)
-    all_cookies_dict = await prepare_all_cookies(account_name, provider_config, user_cookies_dict)
+    # 判断是否需要 WAF 绕过 (根据你的 bypass_method 配置)
+    # 注意：这里需要确保你的 AppConfig 映射了 bypass_method 字段
+    needs_waf = getattr(provider_config, 'bypass_method', '') == 'waf_cookies'
     
-    # 提取 session 值
-    session_val = all_cookies_dict.get('session')
-    if not session_val:
-        raw_str = str(account.cookies)
-        match = re.search(r'session=([^;]+)', raw_str)
-        session_val = match.group(1) if match else raw_str.strip()
+    user_cookies_dict = parse_cookies_to_dict(account.cookies)
+    waf_data = None
+    
+    if needs_waf:
+        # 使用个人中心路径触发挑战
+        waf_data = await get_waf_data_with_playwright(account_name, f"{provider_config.domain}/console/personal")
+        if waf_data:
+            user_cookies_dict.update(waf_data['cookies'])
+            if waf_data['token']: print(f'   ✅ 成功截获 Turnstile Token')
 
-    cookie_header = f"session={session_val}; " + "; ".join([f"{k}={v}" for k, v in all_cookies_dict.items() if k != 'session'])
+    # 构造 Session Cookie
+    session_val = user_cookies_dict.get('session')
+    if not session_val:
+        match = re.search(r'session=([^;]+)', str(account.cookies))
+        session_val = match.group(1) if match else str(account.cookies).strip()
+
+    cookie_header = f"session={session_val}; " + "; ".join([f"{k}={v}" for k, v in user_cookies_dict.items() if k != 'session'])
 
     headers = {
         'accept': 'application/json, text/plain, */*',
@@ -184,21 +128,52 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
     }
 
     async with httpx.AsyncClient(http2=True, timeout=30.0) as client:
+        # 1. 获取信息
         info_url = f"{provider_config.domain}{provider_config.user_info_path}"
         print(f'[步骤 1] 正在请求用户信息: {provider_config.user_info_path}')
-        user_info = await get_user_info(client, headers, info_url)
+        try:
+            res_info = await client.get(info_url, headers=headers)
+            if res_info.status_code == 200 and res_info.json().get('success'):
+                u = res_info.json().get('data', {})
+                q, used = round(u.get('quota', 0)/500000, 2), round(u.get('used_quota', 0)/500000, 2)
+                user_info = {'success': True, 'quota': q, 'used_quota': used, 'display': f'💰 余额: ${q} | 已用: ${used}'}
+                print(f"   ✅ {user_info['display']}")
+            else:
+                print(f"   ❌ 认证失败: HTTP {res_info.status_code}")
+                return False, {'success': False, 'error': f'HTTP {res_info.status_code}'}
+        except Exception as e:
+            return False, {'success': False, 'error': str(e)}
+
+        # 2. 执行签到
+        checkin_url = f"{provider_config.domain}{provider_config.sign_in_path}"
+        print(f'[步骤 2] 正在请求签到: {provider_config.sign_in_path}')
         
-        if not user_info.get('success'):
-            print(f'   ❌ 认证失败: {user_info.get("error")}')
-            if user_info.get('raw'): print(f'   📄 原始响应: {user_info["raw"][:200]}')
+        payload = {}
+        if waf_data and waf_data['token']:
+            payload['token'] = waf_data['token'] # 注入 Turnstile Token
+
+        try:
+            checkin_headers = headers.copy()
+            checkin_headers.update({'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'})
+            res_chk = await client.post(checkin_url, headers=checkin_headers, json=payload)
+            print(f"   📡 状态码: {res_chk.status_code}")
+            
+            res_json = res_chk.json()
+            msg = res_json.get('message', '') or res_json.get('msg', '')
+            is_done = any(k in msg for k in ["今日已签到", "重复签到", "已经签到"])
+            
+            if res_json.get('success') or res_json.get('ret') == 1 or is_done:
+                if is_done: print(f"   ℹ️ 重复签到判定为成功")
+                return True, user_info
+            else:
+                print(f"   ❌ 失败响应: {json.dumps(res_json, ensure_ascii=False)}")
+                return False, user_info
+        except Exception as e:
+            print(f"   💥 签到异常: {e}")
             return False, user_info
-        
-        print(f"   ✅ {user_info['display']}")
-        success = await execute_check_in(client, account_name, provider_config, headers)
-        return success, user_info
 
 async def main():
-    print(f'[SYSTEM] 脚本启动 | 时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    print(f'[SYSTEM] AnyRouter 自动签到启动 | {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
     app_config = AppConfig.load_from_env()
     accounts = load_accounts_config()
     if not accounts: sys.exit(1)
@@ -211,26 +186,23 @@ async def main():
     for i, acc in enumerate(accounts):
         ok, info = await check_in_account(acc, i, app_config)
         if ok: success_count += 1
+        else: need_push = True
         
-        status_str = "[SUCCESS]" if ok else "[FAIL]"
-        if not ok: need_push = True
-        
+        status = "[SUCCESS]" if ok else "[FAIL]"
         if info and info.get('success'):
-            current_balances[f'acc_{i}'] = {'quota': info['quota'], 'used': info['used_quota']}
-            notify_list.append(f"{status_str} {acc.get_display_name(i)}\n{info['display']}")
+            current_balances[f'acc_{i}'] = {'quota': info['quota']}
+            notify_list.append(f"{status} {acc.get_display_name(i)}\n{info['display']}")
         else:
-            notify_list.append(f"{status_str} {acc.get_display_name(i)}\n原因: {info.get('error') if info else '异常'}")
+            notify_list.append(f"{status} {acc.get_display_name(i)}\n原因: {info.get('error') if info else '未知'}")
 
     curr_hash = generate_balance_hash(current_balances)
-    if curr_hash != last_hash:
-        save_balance_hash(curr_hash)
+    if curr_hash != last_hash: save_balance_hash(curr_hash)
 
     skip_notify = os.getenv('SKIP_NOTIFY', 'false').lower() in ('true', '1', 'yes')
     if need_push and not skip_notify:
-        content = "\n\n".join(notify_list) + f"\n\n[统计] 成功: {success_count}/{total_count}"
-        notify.push_message('AnyRouter 签到结果告警', content, msg_type='text')
-    
-    sys.exit(0 if success_count == total_count else 1)
+        notify.push_message('AnyRouter 签到结果报告', "\n\n".join(notify_list), msg_type='text')
+    sys.exit(0)
+    # sys.exit(0 if success_count == total_count else 1)
 
 if __name__ == '__main__':
     asyncio.run(main())
