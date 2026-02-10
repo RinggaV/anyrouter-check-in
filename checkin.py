@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AnyRouter.top 自动签到脚本
-修复 AttributeError 并优化 Cookie 兼容性
+修复配置读取逻辑，支持 Turnstile Token 注入与 WAF 绕过
 """
 
 import asyncio
@@ -85,11 +85,17 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
     print(f"\n{'-'*30}\n[账号] {account_name}\n[站点] {account.provider}\n{'-'*30}")
 
-    # --- 修复点：正确判断是否开启 WAF ---
-    # 尝试从对象属性读取，如果不存在则默认为空字符串
-    bypass_method = getattr(provider_config, 'bypass_method', '')
-    needs_waf = bypass_method == 'waf_cookies'
+    # --- 修正点：从 ProviderConfig 对象中安全读取自定义属性 ---
+    # 由于 AppConfig 加载时可能未映射 bypass_method，我们尝试直接从原始 JSON 配置中提取
+    bypass_method = ""
+    if hasattr(app_config, 'providers_raw'):
+        raw_info = app_config.providers_raw.get(account.provider, {})
+        bypass_method = raw_info.get('bypass_method', '')
+    else:
+        # 兼容性兜底方案
+        bypass_method = getattr(provider_config, 'bypass_method', '')
     
+    needs_waf = bypass_method == 'waf_cookies'
     user_cookies_data = account.cookies
     waf_data = None
     
@@ -98,25 +104,19 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
     # --- 融合 Cookie 构造逻辑 ---
     final_cookies_dict = {}
-    
-    # 解析原始数据
     if isinstance(user_cookies_data, dict):
         final_cookies_dict.update(user_cookies_data)
     elif isinstance(user_cookies_data, str):
-        # 兼容处理 session= 开头或普通的 key=value
         for part in user_cookies_data.split(';'):
             if '=' in part:
                 k, v = part.strip().split('=', 1)
                 final_cookies_dict[k] = v
             elif part.strip():
-                # 针对 Account 12 这种只有一串字符的，存入 session 键
                 final_cookies_dict['session'] = part.strip()
 
-    # 合并 WAF 产生的 Cookie
     if waf_data and waf_data.get('cookies'):
         final_cookies_dict.update(waf_data['cookies'])
 
-    # 构造 Header 字符串
     cookie_header = "; ".join([f"{k}={v}" for k, v in final_cookies_dict.items()])
 
     headers = {
@@ -133,7 +133,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
     }
 
     async with httpx.AsyncClient(http2=True, timeout=30.0) as client:
-        # 3. 获取用户信息
+        # 获取用户信息
         info_url = f"{provider_config.domain}{provider_config.user_info_path}"
         try:
             res_info = await client.get(info_url, headers=headers)
@@ -145,18 +145,16 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
                     user_info = {'success': True, 'quota': q, 'used_quota': round(u.get('used_quota', 0)/500000, 2), 'display': f'💰 余额: ${q}'}
                     print(f"   ✅ {user_info['display']}")
                 else:
-                    print(f"   ❌ 业务失败: {data.get('message')}")
                     return False, {'success': False, 'error': data.get('message')}
             else:
-                print(f"   ❌ 认证失败: HTTP {res_info.status_code}")
                 return False, {'success': False, 'error': f'HTTP {res_info.status_code}'}
         except Exception as e:
             return False, {'success': False, 'error': str(e)}
 
-        # 4. 执行签到
+        # 执行签到
         payload = {}
         if waf_data and waf_data.get('token'):
-            payload['token'] = waf_data['token']
+            payload['token'] = waf_data['token'] # 自动填入截获的 Turnstile Token
 
         try:
             checkin_url = f"{provider_config.domain}{provider_config.sign_in_path}"
