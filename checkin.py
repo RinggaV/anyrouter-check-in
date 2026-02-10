@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AnyRouter.top 自动签到脚本
-修复全盘 401 问题，优化 WAF 配置识别
+修复 AttributeError 并优化 Cookie 兼容性
 """
 
 import asyncio
@@ -63,13 +63,11 @@ async def get_interactive_waf_data(account_name: str, domain: str):
             try:
                 # 访问个人中心页面触发质询
                 await page.goto(f"{domain}/console/personal", wait_until='networkidle', timeout=60000)
-                
                 print(f'[WAF] {account_name}: 等待 Cloudflare 质询 (15s)...')
                 await asyncio.sleep(15) 
                 
                 # 截获 Token
                 token = await page.evaluate("typeof turnstile !== 'undefined' ? turnstile.getResponse() : ''")
-                
                 cookies_list = await page.context.cookies()
                 waf_cookies = {c['name']: c['value'] for c in cookies_list}
                 
@@ -82,16 +80,15 @@ async def get_interactive_waf_data(account_name: str, domain: str):
 
 async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig):
     account_name = account.get_display_name(account_index)
-    # 修正配置获取方式：确保能读取到原始字典中的 bypass_method
-    provider_raw_config = app_config.providers.get(account.provider, {})
     provider_config = app_config.get_provider(account.provider)
     if not provider_config: return False, None
 
     print(f"\n{'-'*30}\n[账号] {account_name}\n[站点] {account.provider}\n{'-'*30}")
 
-    # 1. 判定是否开启 WAF
-    # 优先检查原始字典配置
-    needs_waf = provider_raw_config.get('bypass_method') == 'waf_cookies'
+    # --- 修复点：正确判断是否开启 WAF ---
+    # 尝试从对象属性读取，如果不存在则默认为空字符串
+    bypass_method = getattr(provider_config, 'bypass_method', '')
+    needs_waf = bypass_method == 'waf_cookies'
     
     user_cookies_data = account.cookies
     waf_data = None
@@ -99,30 +96,28 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
     if needs_waf:
         waf_data = await get_interactive_waf_data(account_name, provider_config.domain)
 
-    # 2. 核心修复：融合 Cookie 构造逻辑，防止 401
+    # --- 融合 Cookie 构造逻辑 ---
     final_cookies_dict = {}
     
-    # 首先载入原始 Cookie
+    # 解析原始数据
     if isinstance(user_cookies_data, dict):
         final_cookies_dict.update(user_cookies_data)
     elif isinstance(user_cookies_data, str):
-        # 处理 session= 开头的字符串或普通键值对字符串
+        # 兼容处理 session= 开头或普通的 key=value
         for part in user_cookies_data.split(';'):
             if '=' in part:
                 k, v = part.strip().split('=', 1)
                 final_cookies_dict[k] = v
-            elif part.strip(): # 兼容处理：如果没有 =，当作 session 值
+            elif part.strip():
+                # 针对 Account 12 这种只有一串字符的，存入 session 键
                 final_cookies_dict['session'] = part.strip()
 
-    # 如果有 WAF 数据，进行合并
+    # 合并 WAF 产生的 Cookie
     if waf_data and waf_data.get('cookies'):
         final_cookies_dict.update(waf_data['cookies'])
 
-    # 构造最终 Header 字符串
-    cookie_items = []
-    for k, v in final_cookies_dict.items():
-        cookie_items.append(f"{k}={v}")
-    cookie_header = "; ".join(cookie_items)
+    # 构造 Header 字符串
+    cookie_header = "; ".join([f"{k}={v}" for k, v in final_cookies_dict.items()])
 
     headers = {
         'accept': 'application/json, text/plain, */*',
@@ -142,15 +137,18 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
         info_url = f"{provider_config.domain}{provider_config.user_info_path}"
         try:
             res_info = await client.get(info_url, headers=headers)
-            if res_info.status_code == 200 and res_info.json().get('success'):
-                u = res_info.json().get('data', {})
-                q = round(u.get('quota', 0)/500000, 2)
-                user_info = {'success': True, 'quota': q, 'used_quota': round(u.get('used_quota', 0)/500000, 2), 'display': f'💰 余额: ${q}'}
-                print(f"   ✅ {user_info['display']}")
+            if res_info.status_code == 200:
+                data = res_info.json()
+                if data.get('success'):
+                    u = data.get('data', {})
+                    q = round(u.get('quota', 0)/500000, 2)
+                    user_info = {'success': True, 'quota': q, 'used_quota': round(u.get('used_quota', 0)/500000, 2), 'display': f'💰 余额: ${q}'}
+                    print(f"   ✅ {user_info['display']}")
+                else:
+                    print(f"   ❌ 业务失败: {data.get('message')}")
+                    return False, {'success': False, 'error': data.get('message')}
             else:
                 print(f"   ❌ 认证失败: HTTP {res_info.status_code}")
-                # 打印出 Header 信息辅助排查（不包含完整 Cookie）
-                print(f"   DEBUG: new-api-user={headers['new-api-user']}")
                 return False, {'success': False, 'error': f'HTTP {res_info.status_code}'}
         except Exception as e:
             return False, {'success': False, 'error': str(e)}
@@ -162,7 +160,6 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
         try:
             checkin_url = f"{provider_config.domain}{provider_config.sign_in_path}"
-            # 签到需要增加 Content-Type
             checkin_headers = headers.copy()
             checkin_headers['Content-Type'] = 'application/json'
             
@@ -175,7 +172,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
                 if is_done: print(f"   ℹ️ 重复签到 (成功)")
                 return True, user_info
             else:
-                print(f"   ❌ 失败响应: {msg}")
+                print(f"   ❌ 签到失败: {msg}")
                 return False, user_info
         except Exception:
             return False, user_info
@@ -183,9 +180,6 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 async def main():
     print(f'[SYSTEM] AnyRouter 自动签到启动')
     app_config = AppConfig.load_from_env()
-    # 打印加载的 Provider 数量确认配置
-    print(f'[INFO] Loaded {len(app_config.providers)} custom provider(s) from PROVIDERS environment variable')
-    
     accounts = load_accounts_config()
     if not accounts: sys.exit(1)
 
@@ -209,8 +203,9 @@ async def main():
     curr_hash = generate_balance_hash(current_balances)
     if curr_hash != last_hash: save_balance_hash(curr_hash)
 
-    if need_push and os.getenv('SKIP_NOTIFY', 'false').lower() != 'true':
-        notify.push_message('AnyRouter 签到报告', "\n\n".join(notify_list))
+    skip_notify = os.getenv('SKIP_NOTIFY', 'false').lower() in ('true', '1', 'yes')
+    if need_push and not skip_notify:
+        notify.push_message('AnyRouter 签到结果报告', "\n\n".join(notify_list))
     
     sys.exit(0 if success_count == total_count else 1)
 
