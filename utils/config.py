@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-配置管理模块
+配置管理模块 V2
+修复：不再强制将 bypass_method 设置为 None
 """
 
 import json
@@ -23,20 +24,9 @@ class ProviderConfig:
 	waf_cookie_names: List[str] | None = None
 
 	def __post_init__(self):
-		required_waf_cookies = set()
-		if self.waf_cookie_names and isinstance(self.waf_cookie_names, List):
-			for item in self.waf_cookie_names:
-				name = "" if not item or not isinstance(item, str) else item.strip()
-				if not name:
-					print(f'[WARNING] Found invalid WAF cookie name: {item}')
-					continue
-
-				required_waf_cookies.add(name)
-		
-		if not required_waf_cookies:
-			self.bypass_method = None
-
-		self.waf_cookie_names = list(required_waf_cookies)
+		# 不再强制修改 bypass_method
+		# 即使 waf_cookie_names 为空，也保留 bypass_method 的原始值
+		pass
 
 	@classmethod
 	def from_dict(cls, name: str, data: dict) -> 'ProviderConfig':

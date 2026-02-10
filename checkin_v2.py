@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-AnyRouter 自动签到脚本 V3
-终极改进：添加页面交互模拟来触发 Cloudflare Turnstile 验证
-
+AnyRouter 自动签到脚本 V2
 改进策略：
-1. 模拟真实用户行为（鼠标移动、点击）
-2. 主动触发 Turnstile iframe
-3. 智能等待验证完成
-4. 快速失败机制
+1. 不依赖 waf_cookie_names，只要 bypass_method='waf_cookies' 就触发 WAF 绕过
+2. 缩短等待时间到 30 秒，减少总耗时
+3. 如果 Turnstile 未加载，直接返回 cookies（不等待 token）
+4. 优化重试逻辑
 """
 
 import asyncio
@@ -50,60 +48,14 @@ def generate_balance_hash(balances):
     balance_json = json.dumps(simple_balances, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(balance_json.encode('utf-8')).hexdigest()[:16]
 
-async def simulate_user_interaction(page, account_name: str):
-    """
-    模拟真实用户行为来触发 Cloudflare Turnstile 验证
-    """
-    try:
-        print(f'[WAF] {account_name}: 模拟用户交互...')
-
-        # 1. 模拟鼠标移动
-        await page.mouse.move(100, 100)
-        await asyncio.sleep(0.3)
-        await page.mouse.move(300, 200)
-        await asyncio.sleep(0.3)
-        await page.mouse.move(500, 300)
-        await asyncio.sleep(0.5)
-
-        # 2. 尝试查找并点击 Turnstile checkbox
-        try:
-            # Turnstile 通常在 iframe 中
-            turnstile_frame = page.frame_locator('iframe[src*="challenges.cloudflare.com"]').first
-
-            # 等待 iframe 加载
-            await asyncio.sleep(1)
-
-            # 点击 checkbox
-            checkbox = turnstile_frame.locator('input[type="checkbox"]').first
-            if await checkbox.is_visible(timeout=2000):
-                print(f'[WAF] {account_name}: 找到 Turnstile checkbox，尝试点击...')
-                await checkbox.click()
-                await asyncio.sleep(1)
-            else:
-                # 如果找不到 checkbox，尝试点击整个 iframe 区域
-                print(f'[WAF] {account_name}: 尝试点击 Turnstile 区域...')
-                await turnstile_frame.locator('body').click()
-                await asyncio.sleep(1)
-        except Exception as e:
-            print(f'[WAF] {account_name}: Turnstile 交互失败: {e}')
-
-        # 3. 模拟页面滚动
-        await page.evaluate('window.scrollTo(0, 100)')
-        await asyncio.sleep(0.3)
-        await page.evaluate('window.scrollTo(0, 0)')
-
-    except Exception as e:
-        print(f'[WAF] {account_name}: 用户交互模拟失败: {e}')
-
-async def get_waf_bypass_data(account_name: str, domain: str, max_wait: int = 40):
+async def get_waf_bypass_data(account_name: str, domain: str, max_wait: int = 30):
     """
     获取 WAF 绕过所需的数据（cookies 和可选的 Turnstile token）
 
-    改进策略：
-    1. 访问页面
-    2. 模拟用户交互触发 Turnstile
-    3. 智能等待 token 生成
-    4. 快速失败机制
+    策略：
+    1. 访问页面获取 WAF cookies
+    2. 尝试获取 Turnstile token（最多等待 max_wait 秒）
+    3. 如果 Turnstile 未加载，直接返回 cookies（某些站点可能不需要 token）
     """
     print(f'[WAF] {account_name}: 启动浏览器获取 WAF 数据...')
 
@@ -120,51 +72,37 @@ async def get_waf_bypass_data(account_name: str, domain: str, max_wait: int = 40
                 page = await context.new_page()
 
                 try:
-                    # 1. 访问页面触发 WAF
-                    print(f'[WAF] {account_name}: 访问页面...')
+                    # 访问页面触发 WAF
                     await page.goto(f"{domain}/console/personal", wait_until='networkidle', timeout=60000)
+                    print(f'[WAF] {account_name}: 页面加载完成')
 
-                    # 2. 等待页面完全加载
-                    await asyncio.sleep(2)
+                    # 等待一小段时间让 Turnstile 加载
+                    await asyncio.sleep(3)
 
-                    # 3. 检查 Turnstile 是否存在
+                    # 检查 Turnstile 是否存在
                     turnstile_exists = await page.evaluate("typeof turnstile !== 'undefined'")
 
                     token = ""
                     if turnstile_exists:
-                        print(f'[WAF] {account_name}: 检测到 Turnstile')
-
-                        # 4. 模拟用户交互触发验证
-                        await simulate_user_interaction(page, account_name)
-
-                        # 5. 等待 Turnstile token 生成
-                        print(f'[WAF] {account_name}: 等待 Turnstile 验证完成...')
+                        print(f'[WAF] {account_name}: 检测到 Turnstile，等待验证完成...')
+                        # 等待 Turnstile token（最多 max_wait 秒）
                         check_interval = 2
-                        checks = 0
-                        max_checks = max_wait // check_interval
-
-                        for i in range(max_checks):
+                        for i in range(0, max_wait, check_interval):
                             await asyncio.sleep(check_interval)
-                            checks += 1
-
                             try:
                                 token = await page.evaluate("turnstile.getResponse()")
                                 if token:
-                                    elapsed = checks * check_interval + 2
-                                    print(f'[WAF] {account_name}: ✅ 获取到 Turnstile Token (耗时 {elapsed}s)')
+                                    print(f'[WAF] {account_name}: ✅ 获取到 Turnstile Token (耗时 {i+check_interval+3}s)')
                                     break
-                                elif checks % 5 == 0:  # 每 10 秒打印一次
-                                    print(f'[WAF] {account_name}: 等待中... ({checks * check_interval}s)')
-                            except Exception as e:
-                                if checks == 1:
-                                    print(f'[WAF] {account_name}: Token 读取异常: {e}')
+                            except:
+                                pass
 
                         if not token:
-                            print(f'[WAF] {account_name}: ⚠️ Turnstile Token 未获取到（超时 {max_wait}s）')
+                            print(f'[WAF] {account_name}: ⚠️ Turnstile Token 未获取到（超时 {max_wait+3}s）')
                     else:
                         print(f'[WAF] {account_name}: 未检测到 Turnstile，仅获取 cookies')
 
-                    # 6. 获取所有 cookies
+                    # 获取所有 cookies
                     cookies_list = await page.context.cookies()
                     waf_cookies = {c['name']: c['value'] for c in cookies_list}
 
@@ -192,7 +130,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
     print(f"\n{'-'*30}\n[账号] {account_name}\n[站点] {account.provider}\n{'-'*30}")
 
-    # 判断是否需要 WAF 绕过
+    # 判断是否需要 WAF 绕过（直接读取 bypass_method，不依赖 waf_cookie_names）
     needs_waf = provider_config.bypass_method == 'waf_cookies'
     user_cookies_data = account.cookies
     waf_data = None
@@ -292,7 +230,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
             return False, user_info
 
 async def main():
-    print(f'[SYSTEM] AnyRouter 自动签到启动 V3 (带交互模拟)')
+    print(f'[SYSTEM] AnyRouter 自动签到启动 V2')
     app_config = AppConfig.load_from_env()
     accounts = load_accounts_config()
     if not accounts: sys.exit(1)
