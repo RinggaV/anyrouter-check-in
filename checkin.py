@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AnyRouter.top 多账号自动签到脚本
-修复异步调用导致的 coroutine 错误
+优化：判定“今日已签到”为成功，失败打印原始响应
 """
 
 import asyncio
@@ -90,9 +90,7 @@ async def prepare_all_cookies(account_name, provider_config, user_cookies_dict):
     return user_cookies_dict
 
 async def get_user_info(client, headers, url):
-    """修正：异步获取用户信息"""
     try:
-        # 必须 await
         res = await client.get(url, headers=headers, timeout=30)
         if res.status_code == 200:
             data = res.json()
@@ -101,12 +99,11 @@ async def get_user_info(client, headers, url):
                 q = round(u.get('quota', 0) / 500000, 2)
                 used = round(u.get('used_quota', 0) / 500000, 2)
                 return {'success': True, 'quota': q, 'used_quota': used, 'display': f'💰 余额: ${q} | 已用: ${used}'}
-        return {'success': False, 'error': f'HTTP {res.status_code}'}
+        return {'success': False, 'error': f'HTTP {res.status_code}', 'raw': res.text}
     except Exception as e:
         return {'success': False, 'error': f'请求失败: {str(e)[:50]}'}
 
 async def execute_check_in(client, account_name, provider_config, headers):
-    """修正：异步执行签到"""
     checkin_url = f"{provider_config.domain}{provider_config.sign_in_path}"
     print(f'[步骤 2] 正在请求签到: {provider_config.sign_in_path}')
     
@@ -114,17 +111,28 @@ async def execute_check_in(client, account_name, provider_config, headers):
     checkin_headers.update({'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'})
     
     try:
-        # 必须 await
         res = await client.post(checkin_url, headers=checkin_headers, timeout=30)
         print(f"   📡 状态码: {res.status_code}")
         
         try:
             res_data = res.json()
-            print(f"   📝 响应: {json.dumps(res_data, ensure_ascii=False)}")
-            if res_data.get('ret') == 1 or res_data.get('code') == 0 or res_data.get('success'):
+            msg = res_data.get('message', '') or res_data.get('msg', '')
+            
+            # 逻辑：成功标志位 OR 包含“今日已签到”
+            is_success_msg = any(keyword in msg for keyword in ["今日已签到", "已经签到", "重复签到"])
+            if res_data.get('ret') == 1 or res_data.get('code') == 0 or res_data.get('success') or is_success_msg:
+                if is_success_msg: print(f"   ℹ️ {account_name}: {msg} (判定为成功)")
                 return True
+            else:
+                print(f"   ❌ 签到失败响应: {json.dumps(res_data, ensure_ascii=False)}")
+                return False
         except:
-            return 'success' in res.text.lower()
+            # 非 JSON 响应的模糊匹配
+            raw_text = res.text
+            if 'success' in raw_text.lower() or '今日已签到' in raw_text:
+                return True
+            print(f"   ❌ 原始失败响应: {raw_text}")
+            return False
     except Exception as e:
         print(f"   💥 签到异常: {e}")
     return False
@@ -159,7 +167,6 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
         'cookie': cookie_header
     }
 
-    # 统一使用 AsyncClient
     async with httpx.AsyncClient(http2=True, timeout=30.0) as client:
         info_url = f"{provider_config.domain}{provider_config.user_info_path}"
         print(f'[步骤 1] 正在请求用户信息: {provider_config.user_info_path}')
@@ -167,6 +174,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
         
         if not user_info.get('success'):
             print(f'   ❌ 认证失败: {user_info.get("error")}')
+            if user_info.get('raw'): print(f'   📄 原始响应: {user_info["raw"][:200]}')
             return False, user_info
         
         print(f"   ✅ {user_info['display']}")
@@ -204,7 +212,7 @@ async def main():
     skip_notify = os.getenv('SKIP_NOTIFY', 'false').lower() in ('true', '1', 'yes')
     if need_push and not skip_notify:
         content = "\n\n".join(notify_list) + f"\n\n[统计] 成功: {success_count}/{total_count}"
-        notify.push_message('AnyRouter 签到失败告警', content, msg_type='text')
+        notify.push_message('AnyRouter 签到结果告警', content, msg_type='text')
     
     sys.exit(0 if success_count == total_count else 1)
 
