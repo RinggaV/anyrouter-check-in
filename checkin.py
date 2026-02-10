@@ -57,7 +57,8 @@ def parse_cookies_to_dict(cookies_data):
     return cookies_dict
 
 async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
-    print(f'[WAF] {account_name}: 正在启动浏览器环境绕过防护...')
+    """优化：更长时间等待挑战完成"""
+    print(f'[WAF] {account_name}: 启动环境绕过 {login_url} ...')
     async with async_playwright() as p:
         import tempfile
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -69,15 +70,24 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
             )
             page = await context.new_page()
             try:
-                await page.goto(login_url, wait_until='networkidle')
-                await asyncio.sleep(5) 
+                # 访问页面并等待较长时间以通过 Cloudflare 质询
+                await page.goto(login_url, wait_until='networkidle', timeout=60000)
+                print(f'[WAF] {account_name}: 页面已加载，等待质询挑战...')
+                await asyncio.sleep(10) # 给予足够时间完成“Just a moment”挑战
+                
                 cookies = await page.context.cookies()
-                waf_cookies = {c['name']: c['value'] for c in cookies if c['name'] in required_cookies or 'cf' in c['name'].lower()}
-                print(f'[WAF] {account_name}: 成功获取到 {len(waf_cookies)} 个 Cookies')
+                waf_cookies = {c['name']: c['value'] for c in cookies}
+                
+                # 针对 Turnstile：尝试从页面获取 token (如果存在)
+                turnstile_token = await page.evaluate("typeof turnstile !== 'undefined' ? turnstile.getResponse() : ''")
+                if turnstile_token:
+                    waf_cookies['turnstile_token'] = turnstile_token
+                
+                print(f'[WAF] {account_name}: 获取到 {len(waf_cookies)} 个 Cookies/Tokens')
                 await context.close()
                 return waf_cookies
             except Exception as e:
-                print(f'[FAILED] {account_name}: WAF 挑战异常: {e}')
+                print(f'[FAILED] {account_name}: WAF/挑战失败: {e}')
                 await context.close()
                 return None
 
@@ -103,15 +113,21 @@ async def get_user_info(client, headers, url):
     except Exception as e:
         return {'success': False, 'error': f'请求失败: {str(e)[:50]}'}
 
-async def execute_check_in(client, account_name, provider_config, headers):
+async def execute_check_in(client, account_name, provider_config, headers, waf_data=None):
+    """优化：处理需要 Token 的签到请求"""
     checkin_url = f"{provider_config.domain}{provider_config.sign_in_path}"
     print(f'[步骤 2] 正在请求签到: {provider_config.sign_in_path}')
     
     checkin_headers = headers.copy()
     checkin_headers.update({'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'})
     
+    # 如果 WAF 步骤获取到了 turnstile_token，尝试将其加入请求体
+    payload = {}
+    if waf_data and waf_data.get('turnstile_token'):
+        payload['token'] = waf_data['turnstile_token'] # 根据不同站点可能需要改为 turnstile_token
+
     try:
-        res = await client.post(checkin_url, headers=checkin_headers, timeout=30)
+        res = await client.post(checkin_url, headers=checkin_headers, json=payload, timeout=30)
         print(f"   📡 状态码: {res.status_code}")
         
         try:
