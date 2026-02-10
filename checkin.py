@@ -163,14 +163,31 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
     provider_config = app_config.get_provider(account.provider)
     if not provider_config: return False, None
 
-    # 格式化 Cookie 字符串，确保包含 session=
-    raw_cookie = account.cookies.strip()
-    session_val = raw_cookie.split('=', 1)[1] if raw_cookie.startswith('session=') else raw_cookie
+    # --- 修复逻辑开始 ---
+    # 检查 account.cookies 的类型
+    raw_cookie_data = account.cookies
+    
+    if isinstance(raw_cookie_data, dict):
+        # 如果是字典，将其转为 key=value; 格式的字符串
+        raw_cookie = "; ".join([f"{k}={v}" for k, v in raw_cookie_data.items()])
+    else:
+        # 如果是字符串，直接使用并去除空格
+        raw_cookie = str(raw_cookie_data).strip()
+
+    # 处理 session= 前缀逻辑
+    if "session=" in raw_cookie:
+        # 提取 session= 之后的部分，防止重复嵌套
+        import re
+        match = re.search(r'session=([^;]+)', raw_cookie)
+        session_val = match.group(1) if match else raw_cookie
+    else:
+        session_val = raw_cookie
+
     formatted_cookie = f'session={session_val}'
+    # --- 修复逻辑结束 ---
 
     client = httpx.Client(http2=True, timeout=30.0)
     try:
-        # 同步测试脚本成功的 Headers
         headers = {
             'accept': 'application/json, text/plain, */*',
             'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
@@ -185,7 +202,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0',
             'cookie': formatted_cookie
         }
-
+        # ... 后续逻辑保持不变
         user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
         user_info = get_user_info(client, headers, user_info_url)
         
