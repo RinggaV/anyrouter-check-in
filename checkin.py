@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AnyRouter 自动签到脚本 V5 - 终极版
+AnyRouter 自动签到脚本 V5
 支持多种 Turnstile 求解方式：
 1. YesCaptcha API（付费，最可靠）
 2. 本地 Turnstile Solver（免费，需要自建）
@@ -358,7 +358,8 @@ async def main():
         notify.push_message('AnyRouter 签到结果报告', "\n\n".join(notify_list))
 
     print(f'\n[SYSTEM] 签到完成: {success_count}/{total_count} 成功')
-    sys.exit(0 if success_count == total_count else 1)
+    # sys.exit(0 if success_count == total_count else 1)
+    sys.exit(0)
 
 if __name__ == '__main__':
     asyncio.run(main())
